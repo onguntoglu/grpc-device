@@ -1,0 +1,193 @@
+name: Desktop OS Builds
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  CMAKE_VERSION: 3.18.3
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+        - {
+            name: "Windows Build", artifact: "Windows.tar.xz",
+            os: windows-latest,
+            build_type: "Release", cc: "gcc-9", cxx: "g++-9",
+            cmake_platform: "-A x64",
+            # On msvc, the -j flag does not help build times and causes intermittent
+            # file permission errors.
+            cmake_number_of_jobs: ""
+          }
+        - {
+            name: "Ubuntu Build", artifact: "Linux.tar.xz",
+            os: ubuntu-18.04,
+            build_type: "Release", cc: "gcc-9", cxx: "g++-9",
+            cmake_platform: "",
+            glibc_version: "2_27",
+            cmake_number_of_jobs: "-j 2"
+          }
+
+    steps:
+    - name: Checkout Repo
+      uses: actions/checkout@v2
+
+    - name: Setup python3
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.x'
+
+    - name: Install nasm
+      if: ${{ runner.os == 'Windows' }}
+      run: choco install nasm
+
+    - name: Update Submodules
+      run: git submodule update --init --recursive --depth=1
+
+    - name: Configure
+      shell: cmake -P {0}
+      run: |
+        set(ENV{CC} ${{ matrix.config.cc }})
+        set(ENV{CXX} ${{ matrix.config.cxx }})
+        set(path_separator ":")
+        if ("${{ runner.os }}" STREQUAL "Windows")
+          set(path_separator ";")
+        endif()
+        set(ENV{PATH} "$ENV{GITHUB_WORKSPACE}${path_separator}$ENV{PATH}")
+        execute_process(
+          COMMAND cmake
+            -S .
+            -B build
+            -D CMAKE_BUILD_TYPE=$ENV{BUILD_TYPE}
+            ${{ matrix.config.cmake_platform }}
+          RESULT_VARIABLE result
+        )
+        if (NOT result EQUAL 0)
+          message(FATAL_ERROR "Bad exit status")
+        endif()
+
+    - name: Build
+      shell: cmake -P {0}
+      run: |
+        execute_process(
+          COMMAND cmake --build build --config $ENV{BUILD_TYPE} ${{ matrix.config.cmake_number_of_jobs }}
+          RESULT_VARIABLE result
+          OUTPUT_VARIABLE output
+          ERROR_VARIABLE output
+          ECHO_OUTPUT_VARIABLE ECHO_ERROR_VARIABLE
+        )
+        if (NOT result EQUAL 0)
+          string(REGEX MATCH "FAILED:.*$" error_message "${output}")
+          string(REPLACE "\n" "%0A" error_message "${error_message}")
+          message("::error::${error_message}")
+          message(FATAL_ERROR "Build failed")
+        endif()
+
+    # The generated source in git must match the output of workflow builds.
+    # If this step fails, something is changing during build. Either:
+    # 1. Fix non-deterministic codegen, OR
+    # 2. Build locally to ensure generated files are up-to-date.
+    - name: Check for files dirtied by codegen
+      run: git diff --exit-code
+
+    - name: Run Tests
+      shell: cmake -P {0}
+      run: |
+        include(ProcessorCount)
+        ProcessorCount(N)
+
+        execute_process(
+          COMMAND ctest -j ${N} -C $ENV{BUILD_TYPE} -E System --output-on-failure
+          WORKING_DIRECTORY build
+          RESULT_VARIABLE result
+        )
+        if (NOT result EQUAL 0)
+            message(FATAL_ERROR "Running tests failed!")
+        endif()
+
+    - name: Tar Linux Server Binaries
+      if: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/releases')) && (runner.os == 'Linux') }}
+      run: >-
+        tar -cvzf ni-grpc-device-server-linux-glibc${{ matrix.config.glibc_version }}-x64.tar.gz
+        -C ${GITHUB_WORKSPACE}/build
+        ni_grpc_device_server
+        server_config.json
+        -C ${GITHUB_WORKSPACE}
+        LICENSE
+        ThirdPartyNotices.txt
+
+    - name: Upload Linux Server Binaries Artifact
+      uses: actions/upload-artifact@v2
+      if: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/releases')) && (runner.os == 'Linux') }}
+      with:
+        name: ni-grpc-device-server-linux-glibc${{ matrix.config.glibc_version }}-x64
+        path: ni-grpc-device-server-linux-glibc${{ matrix.config.glibc_version }}-x64.tar.gz
+        retention-days: 5
+
+    - name: Tar Linux Test Binaries
+      if: ${{ runner.os == 'Linux' }}
+      run: >-
+        tar -cvzf ni-grpc-device-tests-linux-glibc${{ matrix.config.glibc_version }}-x64.tar.gz
+        -C ${GITHUB_WORKSPACE}/build
+        certs/
+        IntegrationTestsRunner
+        libTestApi.so
+        SystemTestsRunner
+        test_mutual_tls_config.json
+        UnitTestsRunner
+        -C ${GITHUB_WORKSPACE}
+        LICENSE
+        ThirdPartyNotices.txt
+
+    - name: Upload Linux Test Binaries Artifact
+      uses: actions/upload-artifact@v2
+      if: ${{ runner.os == 'Linux' }}
+      with:
+        name: ni-grpc-device-tests-linux-glibc${{ matrix.config.glibc_version }}-x64
+        path: ni-grpc-device-tests-linux-glibc${{ matrix.config.glibc_version }}-x64.tar.gz
+        retention-days: 5
+
+    - name: Upload Windows Server Information Artifact
+      uses: actions/upload-artifact@v2
+      if: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/releases')) && (runner.os == 'Windows') }}
+      with:
+        name: ni-grpc-device-server-windows-x64
+        path: |
+          LICENSE
+          ThirdPartyNotices.txt
+        retention-days: 5
+
+    - name: Upload Windows Server Binaries Artifact
+      uses: actions/upload-artifact@v2
+      if: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/releases')) && (runner.os == 'Windows') }}
+      with:
+        name: ni-grpc-device-server-windows-x64
+        path: |
+          build/Release/ni_grpc_device_server.exe
+          build/Release/server_config.json
+        retention-days: 5
+
+    - name: Upload Windows Test Binaries Artifact
+      uses: actions/upload-artifact@v2
+      if: ${{ runner.os == 'Windows' }}
+      with:
+        name: ni-grpc-device-tests-windows-x64
+        path: |
+          build/Release/certs/
+          build/Release/IntegrationTestsRunner.exe
+          build/Release/TestApi.dll
+          build/Release/SystemTestsRunner.exe
+          build/Release/LTE20MHz Waveform (Two Subframes).json
+          build/Release/NR_FR2_UL_SISO_CC-1_BW-50MHz_SCS-120kHz.json
+          build/Release/WLAN_80211n_20MHz_1Seg_2Chain_MIMO.json
+          build/Release/test_mutual_tls_config.json
+          build/Release/UnitTestsRunner.exe
+          LICENSE
+          ThirdPartyNotices.txt
+        retention-days: 5
